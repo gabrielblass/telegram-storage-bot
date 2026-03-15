@@ -6,10 +6,9 @@ import psycopg2
 from psycopg2 import pool
 from flask import Flask
 from threading import Thread
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ==============================
-# CONFIGURACIÓN
+# 1. CONFIGURACIÓN
 # ==============================
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -17,12 +16,16 @@ CHANNEL_ID = int(os.environ.get("CHANNEL_ID", -1003628952931))
 DB_URL = os.environ.get("DATABASE_URL")
 
 if not TOKEN:
-    raise ValueError("TOKEN no configurado")
+    raise ValueError("❌ TELEGRAM_TOKEN no configurado")
 
+if not DB_URL:
+    raise ValueError("❌ DATABASE_URL no configurado")
+
+# Bot optimizado para ráfagas
 bot = telebot.TeleBot(
     TOKEN,
     threaded=True,
-    num_threads=80
+    num_threads=120
 )
 
 logging.basicConfig(
@@ -31,24 +34,31 @@ logging.basicConfig(
 )
 
 # ==============================
-# POOL POSTGRESQL
+# 2. POOL DE CONEXIONES DB
 # ==============================
 
-db_pool = psycopg2.pool.SimpleConnectionPool(
-    1,
-    20,
-    DB_URL
-)
+try:
+    db_pool = psycopg2.pool.SimpleConnectionPool(
+        1,
+        40,
+        DB_URL
+    )
+    logging.info("✅ Pool PostgreSQL iniciado")
+except Exception as e:
+    logging.error(f"❌ Error creando pool DB: {e}")
+    raise
 
 # ==============================
-# BASE DE DATOS
+# 3. VERIFICAR DUPLICADOS
 # ==============================
 
-def check_and_save(file_unique_id, file_type):
+def check_and_save(file_unique_id):
 
     conn = None
+    cur = None
 
     try:
+
         conn = db_pool.getconn()
         cur = conn.cursor()
 
@@ -58,55 +68,57 @@ def check_and_save(file_unique_id, file_type):
         )
 
         if cur.fetchone():
-            cur.close()
             return "duplicado"
 
         cur.execute(
-            "INSERT INTO storage (file_unique_id,file_type) VALUES (%s,%s)",
-            (file_unique_id,file_type)
+            "INSERT INTO storage (file_unique_id) VALUES (%s)",
+            (file_unique_id,)
         )
 
         conn.commit()
-        cur.close()
-
         return "nuevo"
 
     except Exception as e:
 
-        logging.error(f"DB Error {e}")
+        logging.error(f"DB Error: {e}")
         return "error"
 
     finally:
+
+        if cur:
+            cur.close()
 
         if conn:
             db_pool.putconn(conn)
 
 # ==============================
-# LIMPIAR CHAT
+# 4. LIMPIEZA ASÍNCRONA
 # ==============================
 
-def cleanup_success(chat_id,status_id,original_id):
+def fast_cleanup(chat_id, status_id, original_id):
 
-    time.sleep(6)
+    time.sleep(3)
 
     try:
-        bot.delete_message(chat_id,status_id)
+        bot.delete_message(chat_id, status_id)
     except:
         pass
 
     try:
-        bot.delete_message(chat_id,original_id)
+        bot.delete_message(chat_id, original_id)
     except:
         pass
 
 # ==============================
-# PROCESAR MENSAJE
+# 5. DETECTAR MEDIA
 # ==============================
 
-def process_message(message):
+def get_media(message):
+
+    if message.content_type == "photo":
+        return message.photo[-1]
 
     media_map = {
-        "photo": message.photo[-1] if message.photo else None,
         "video": message.video,
         "document": message.document,
         "audio": message.audio,
@@ -114,104 +126,97 @@ def process_message(message):
         "video_note": message.video_note
     }
 
-    media = media_map.get(message.content_type)
+    return media_map.get(message.content_type)
 
-    if not media:
-        return
+# ==============================
+# 6. HANDLER PRINCIPAL
+# ==============================
 
-    # verificar duplicado
-    res = check_and_save(media.file_unique_id,message.content_type)
-
-    if res == "duplicado":
-
-        status_dup = bot.reply_to(
-            message,
-            "⚠️ Este archivo ya existe en el almacén"
-        )
-
-        Thread(
-            target=cleanup_success,
-            args=(message.chat.id,status_dup.message_id,message.message_id),
-            daemon=True
-        ).start()
-
-        return
-
-    status_msg = bot.reply_to(message,"⚡ Guardando archivo...")
+@bot.message_handler(content_types=[
+    'photo',
+    'video',
+    'document',
+    'audio',
+    'video_note',
+    'voice'
+])
+def forward_handler(message):
 
     try:
 
-        sent = bot.copy_message(
+        media = get_media(message)
+
+        if not media:
+            return
+
+        file_id = getattr(media, "file_unique_id", None)
+
+        if not file_id:
+            return
+
+        # verificar duplicado
+        result = check_and_save(file_id)
+
+        if result == "duplicado":
+
+            temp = bot.reply_to(
+                message,
+                "⚠️ Este archivo ya existe en el almacén."
+            )
+
+            Thread(
+                target=fast_cleanup,
+                args=(message.chat.id, temp.message_id, message.message_id),
+                daemon=True
+            ).start()
+
+            return
+
+        # mensaje de estado
+        status_msg = bot.reply_to(
+            message,
+            "🚀 Reenviando al canal..."
+        )
+
+        # reenviar sin descargar archivo
+        bot.forward_message(
             chat_id=CHANNEL_ID,
             from_chat_id=message.chat.id,
             message_id=message.message_id
         )
 
-        msg_id = sent.message_id
-
-        channel_internal_id = str(CHANNEL_ID)[4:]
-        link = f"https://t.me/c/{channel_internal_id}/{msg_id}"
-
-        markup = InlineKeyboardMarkup()
-
-        markup.add(
-            InlineKeyboardButton(
-                "📂 Ver archivo",
-                url=link
-            )
-        )
-
         bot.edit_message_text(
-            "✅ Archivo guardado",
-            message.chat.id,
-            status_msg.message_id,
-            reply_markup=markup
-        )
-
-        Thread(
-            target=cleanup_success,
-            args=(message.chat.id,status_msg.message_id,message.message_id),
-            daemon=True
-        ).start()
-
-    except Exception as e:
-
-        logging.error(f"Telegram error {e}")
-
-        bot.edit_message_text(
-            f"❌ Error: {e}",
+            "✅ Reenviado con éxito",
             message.chat.id,
             status_msg.message_id
         )
 
-# ==============================
-# HANDLER
-# ==============================
+        Thread(
+            target=fast_cleanup,
+            args=(message.chat.id, status_msg.message_id, message.message_id),
+            daemon=True
+        ).start()
 
-@bot.message_handler(content_types=[
-'photo','video','document','audio','voice','video_note'
-])
-def secure_handler(message):
+    except telebot.apihelper.ApiTelegramException as e:
 
-    try:
-        process_message(message)
+        logging.error(f"Telegram API Error: {e}")
 
     except Exception as e:
 
-        logging.error(f"Handler crash {e}")
+        logging.error(f"Handler Error: {e}")
 
 # ==============================
-# SERVIDOR RENDER
+# 7. SERVIDOR RENDER
 # ==============================
 
 app = Flask(__name__)
 
-@app.route("/")
+@app.route('/')
 def index():
-    return "Bot activo 🚀"
+    return "Bot de almacenamiento activo 🚀"
 
 # ==============================
-# INICIAR BOT
+# 8. INICIAR BOT
 # ==============================
 
 if __name__ == "__main__":
@@ -219,12 +224,12 @@ if __name__ == "__main__":
     Thread(
         target=lambda: app.run(
             host="0.0.0.0",
-            port=int(os.environ.get("PORT",8080))
+            port=int(os.environ.get("PORT", 8080))
         ),
         daemon=True
     ).start()
 
-    logging.info("Bot listo")
+    logging.info("🚀 Bot iniciado")
 
     bot.infinity_polling(
         timeout=60,
