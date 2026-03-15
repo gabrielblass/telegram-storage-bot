@@ -3,6 +3,7 @@ import os
 import time
 import logging
 import psycopg2
+import requests
 from psycopg2 import pool
 from flask import Flask
 from threading import Thread
@@ -10,245 +11,164 @@ from queue import Queue
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ==============================
-# CONFIGURACIÓN
+# 1. CONFIGURACIÓN
 # ==============================
-
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID"))
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", -1003628952931))
 DB_URL = os.environ.get("DATABASE_URL")
+RENDER_URL = "https://telegram-storage-bot-y9pu.onrender.com"
 
+# Bot con múltiples hilos para recibir mensajes sin pausa
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=120)
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # ==============================
-# POOL DB
+# 2. POOL DE BASE DE DATOS
 # ==============================
-
-db_pool = psycopg2.pool.SimpleConnectionPool(1,40,DB_URL)
+try:
+    db_pool = psycopg2.pool.SimpleConnectionPool(1, 50, DB_URL)
+    conn = db_pool.getconn()
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS storage (file_unique_id TEXT PRIMARY KEY)")
+    conn.commit()
+    db_pool.putconn(conn)
+    logging.info("✅ Base de datos conectada y lista")
+except Exception as e:
+    logging.error(f"❌ Error crítico en DB: {e}")
 
 # ==============================
-# COLA DE PROCESAMIENTO
+# 3. GESTIÓN DE COLA Y RESUMEN
 # ==============================
-
 file_queue = Queue()
-
-# ==============================
-# CONTROL DE LOTES
-# ==============================
-
 batch_data = {}
 
-# ==============================
-# DB DUPLICADOS
-# ==============================
-
-def check_and_save(file_id):
-
-    conn=None
-    cur=None
-
+def check_and_save(file_unique_id):
+    conn = None
     try:
-
-        conn=db_pool.getconn()
-        cur=conn.cursor()
-
-        cur.execute(
-            "SELECT 1 FROM storage WHERE file_unique_id=%s",
-            (file_id,)
-        )
-
+        conn = db_pool.getconn()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM storage WHERE file_unique_id = %s", (file_unique_id,))
         if cur.fetchone():
             return "duplicado"
-
-        cur.execute(
-            "INSERT INTO storage(file_unique_id) VALUES(%s)",
-            (file_id,)
-        )
-
+        cur.execute("INSERT INTO storage (file_unique_id) VALUES (%s)", (file_unique_id,))
         conn.commit()
         return "nuevo"
-
-    except Exception as e:
-
-        logging.error(e)
-        return "error"
-
+    except: return "error"
     finally:
-
-        if cur: cur.close()
         if conn: db_pool.putconn(conn)
 
 # ==============================
-# DETECTAR MEDIA
+# 4. TRABAJADOR ASÍNCRONO
 # ==============================
-
-def get_media(message):
-
-    if message.content_type=="photo":
-        return message.photo[-1]
-
-    media_map={
-        "video":message.video,
-        "document":message.document,
-        "audio":message.audio,
-        "voice":message.voice,
-        "video_note":message.video_note
-    }
-
-    return media_map.get(message.content_type)
-
-# ==============================
-# TRABAJADOR DE COLA
-# ==============================
-
 def worker():
-
     while True:
-
-        message=file_queue.get()
-
+        message = file_queue.get()
         try:
-
             process_message(message)
-
         except Exception as e:
-
-            logging.error(e)
-
+            logging.error(f"Error en worker: {e}")
         file_queue.task_done()
 
-# iniciar worker
-Thread(target=worker,daemon=True).start()
-
-# ==============================
-# PROCESAR MENSAJE
-# ==============================
+Thread(target=worker, daemon=True).start()
 
 def process_message(message):
+    # Obtener el objeto de media
+    media = None
+    if message.content_type == 'photo': media = message.photo[-1]
+    elif message.content_type == 'video': media = message.video
+    elif message.content_type == 'document': media = message.document
+    else: media = getattr(message, message.content_type)
 
-    media=get_media(message)
+    if not media: return
 
-    if not media:
-        return
-
-    user_id=message.chat.id
-
+    user_id = message.chat.id
     if user_id not in batch_data:
+        batch_data[user_id] = {"ok": 0, "dup": 0, "fail": 0, "last_link": None}
 
-        batch_data[user_id]={
-            "ok":0,
-            "dup":0,
-            "fail":[],
-            "last_link":None
-        }
-
-    file_id=media.file_unique_id
-
-    result=check_and_save(file_id)
-
-    if result=="duplicado":
-
-        batch_data[user_id]["dup"]+=1
-        batch_data[user_id]["fail"].append("duplicado")
+    # Verificar duplicado
+    result = check_and_save(media.file_unique_id)
+    if result == "duplicado":
+        batch_data[user_id]["dup"] += 1
         return
 
     try:
-
-        sent=bot.forward_message(
+        # Reenvío directo (Soporta hasta 2GB)
+        sent = bot.forward_message(
             chat_id=CHANNEL_ID,
             from_chat_id=message.chat.id,
             message_id=message.message_id
         )
+        
+        # Generar link del canal
+        msg_id = sent.message_id
+        channel_internal = str(CHANNEL_ID).replace("-100", "")
+        batch_data[user_id]["last_link"] = f"https://t.me/c/{channel_internal}/{msg_id}"
+        batch_data[user_id]["ok"] += 1
 
-        msg_id=sent.message_id
+        # Borrar el mensaje original para limpiar el chat
+        bot.delete_message(message.chat.id, message.message_id)
 
-        channel_internal=str(CHANNEL_ID)[4:]
+    except Exception as e:
+        logging.error(f"Error reenviando: {e}")
+        batch_data[user_id]["fail"] += 1
 
-        link=f"https://t.me/c/{channel_internal}/{msg_id}"
+# ==============================
+# 5. MANEJADORES DE COMANDOS Y MEDIA
+# ==============================
+@bot.message_handler(commands=['resumen'])
+def send_resumen(message):
+    user_id = message.chat.id
+    if user_id not in batch_data:
+        bot.reply_to(message, "No hay actividad reciente.")
+        return
 
-        batch_data[user_id]["last_link"]=link
-        batch_data[user_id]["ok"]+=1
+    data = batch_data[user_id]
+    text = f"📦 *Resultado del envío*\n\n✅ Guardados: `{data['ok']}`\n⚠️ Duplicados: `{data['dup']}`\n❌ Errores: `{data['fail']}`"
+    
+    markup = InlineKeyboardMarkup()
+    if data["last_link"]:
+        markup.add(InlineKeyboardButton("📂 Ver último archivo", url=data["last_link"]))
+    
+    bot.send_message(user_id, text, reply_markup=markup, parse_mode="Markdown")
 
+@bot.message_handler(commands=['reset'])
+def reset_db(message):
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM storage")
+        conn.commit()
+        db_pool.putconn(conn)
+        batch_data[message.chat.id] = {"ok": 0, "dup": 0, "fail": 0, "last_link": None}
+        bot.reply_to(message, "♻️ Memoria reseteada. Puedes enviar todo de nuevo.")
     except:
+        bot.reply_to(message, "❌ Error al resetear.")
 
-        batch_data[user_id]["fail"].append("error")
-
-# ==============================
-# HANDLER
-# ==============================
-
-@bot.message_handler(content_types=[
-'photo','video','document','audio','voice','video_note'
-])
-def handle(message):
-
+@bot.message_handler(content_types=['photo', 'video', 'document', 'audio', 'voice', 'video_note'])
+def handle_incoming(message):
     file_queue.put(message)
 
 # ==============================
-# COMANDO RESUMEN
+# 6. SERVIDOR Y MANTENIMIENTO
 # ==============================
+app = Flask(__name__)
+@app.route('/')
+def home(): return "Bot High-Performance Activo 🚀"
 
-@bot.message_handler(commands=["resumen"])
-def resumen(message):
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 
-    user_id=message.chat.id
+def wake_up():
+    while True:
+        try: requests.get(RENDER_URL)
+        except: pass
+        time.sleep(600)
 
-    if user_id not in batch_data:
-
-        bot.reply_to(message,"No hay archivos procesados.")
-        return
-
-    data=batch_data[user_id]
-
-    text=f"""
-📦 Resultado del envío
-
-✅ Correctos: {data['ok']}
-⚠️ Duplicados: {data['dup']}
-❌ Fallidos: {len(data['fail'])}
-"""
-
-    markup=None
-
-    if data["last_link"]:
-
-        markup=InlineKeyboardMarkup()
-        markup.add(
-            InlineKeyboardButton(
-                "📂 Ver último archivo",
-                url=data["last_link"]
-            )
-        )
-
-    bot.send_message(
-        message.chat.id,
-        text,
-        reply_markup=markup
-    )
-
-# ==============================
-# SERVIDOR
-# ==============================
-
-app=Flask(__name__)
-
-@app.route("/")
-def home():
-    return "Bot activo"
-
-# ==============================
-# INICIAR BOT
-# ==============================
-
-if __name__=="__main__":
-
-    Thread(
-        target=lambda: app.run(
-            host="0.0.0.0",
-            port=int(os.environ.get("PORT",8080))
-        ),
-        daemon=True
-    ).start()
-
-    bot.infinity_polling()
+if __name__ == "__main__":
+    Thread(target=run_web, daemon=True).start()
+    Thread(target=wake_up, daemon=True).start()
+    logging.info("🚀 Iniciando Infinity Polling")
+    bot.infinity_polling(timeout=90, long_polling_timeout=30)
