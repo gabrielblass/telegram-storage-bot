@@ -2,7 +2,8 @@ import telebot
 import os
 import time
 import logging
-import requests  # Librería para el sistema anti-suspensión
+import psycopg2
+import requests
 from flask import Flask
 from threading import Thread
 
@@ -11,117 +12,125 @@ from threading import Thread
 # -----------------------------
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", -1003628952931))
-# Tu enlace de Render para que el bot se visite a sí mismo
+DB_URL = os.environ.get("DATABASE_URL")
 RENDER_URL = "https://telegram-storage-bot-y9pu.onrender.com"
 
 bot = telebot.TeleBot(TOKEN)
 
-# Logging profesional para Render
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # -----------------------------
-# 2. SISTEMA ANTI SPAM
+# 2. FUNCIONES DE BASE DE DATOS
 # -----------------------------
-last_message = {}
+def get_db_connection():
+    return psycopg2.connect(DB_URL)
 
-def anti_spam(user_id):
-    now = time.time()
-    if user_id in last_message:
-        if now - last_message[user_id] < 1.5:
-            return True
-    last_message[user_id] = now
-    return False
+def init_db():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute('''CREATE TABLE IF NOT EXISTS storage (
+                    file_unique_id TEXT PRIMARY KEY,
+                    file_type TEXT)''')
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def is_duplicate(file_unique_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM storage WHERE file_unique_id = %s", (file_unique_id,))
+    exists = cur.fetchone()
+    cur.close()
+    conn.close()
+    return exists is not None
+
+def save_file(file_unique_id, file_type):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO storage (file_unique_id, file_type) VALUES (%s, %s) ON CONFLICT DO NOTHING", 
+                (file_unique_id, file_type))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_count():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM storage")
+    count = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    return count
 
 # -----------------------------
-# 3. LIMPIEZA AUTOMÁTICA (HILOS)
+# 3. LIMPIEZA Y COMANDOS
 # -----------------------------
 def delete_later(chat_id, status_id, original_id, delay=4):
-    """Borra el aviso del bot y el archivo original del usuario"""
     time.sleep(delay)
     try:
-        bot.delete_message(chat_id, status_id)    # Borra "✅ Almacenado"
-        bot.delete_message(chat_id, original_id)  # Borra el video/foto que tú enviaste
-    except Exception as e:
-        logging.warning(f"No se pudo limpiar el chat: {e}")
+        bot.delete_message(chat_id, status_id)
+        bot.delete_message(chat_id, original_id)
+    except: pass
+
+@bot.message_handler(commands=['reset'])
+def reset_storage(message):
+    """Borra todos los registros para empezar de cero"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM storage")
+    conn.commit()
+    cur.close()
+    conn.close()
+    msg = bot.reply_to(message, "🗑️ Base de datos reiniciada. ¡Todo de cero!")
+    time.sleep(5)
+    bot.delete_message(message.chat.id, msg.message_id)
 
 # -----------------------------
-# 4. MANEJO DE MEDIA
+# 4. MANEJO DE MEDIA (50+ ARCHIVOS)
 # -----------------------------
 @bot.message_handler(content_types=['photo', 'video'])
 def media_handler(message):
-    # Filtro Anti-Spam
-    if anti_spam(message.from_user.id):
-        return
-
-    tipo = "imagen" if message.content_type == "photo" else "video"
-    status_msg = bot.reply_to(message, f"⏳ Procesando {tipo}...")
+    file_obj = message.photo[-1] if message.content_type == 'photo' else message.video
+    f_type = "foto" if message.content_type == 'photo' else "video"
+    
+    unique_id = file_obj.file_unique_id
+    repetido = is_duplicate(unique_id)
+    
+    # Aviso de procesamiento
+    status_text = f"⏳ Procesando {f_type}..."
+    if repetido: status_text = f"⚠️ {f_type.capitalize()} repetido, guardando igual..."
+    
+    status_msg = bot.reply_to(message, status_text)
 
     try:
-        # COPIAR AL CANAL (Elimina el 'reenviado de...')
-        bot.copy_message(
-            chat_id=CHANNEL_ID,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id
-        )
-
-        bot.edit_message_text(
-            f"✅ {tipo.capitalize()} guardado correctamente",
-            message.chat.id,
-            status_msg.message_id
-        )
-
+        bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=message.chat.id, message_id=message.message_id)
+        save_file(unique_id, f_type)
+        total = get_count()
+        
+        bot.edit_message_text(f"✅ {f_type.capitalize()} #{total} guardado", 
+                             message.chat.id, status_msg.message_id)
     except Exception as e:
-        logging.error(f"Error en {tipo}: {e}")
-        bot.edit_message_text(
-            "❌ Error al guardar en el canal",
-            message.chat.id,
-            status_msg.message_id
-        )
+        logging.error(f"Error: {e}")
+        bot.edit_message_text("❌ Error al guardar", message.chat.id, status_msg.message_id)
 
-    # Lanzar hilo de limpieza para dejar el chat vacío
-    Thread(
-        target=delete_later,
-        args=(message.chat.id, status_msg.message_id, message.message_id)
-    ).start()
+    Thread(target=delete_later, args=(message.chat.id, status_msg.message_id, message.message_id)).start()
 
 # -----------------------------
-# 5. SERVIDOR WEB Y ANTI-SUSPENSIÓN
+# 5. WEB Y MANTENIMIENTO
 # -----------------------------
 app = Flask(__name__)
-
 @app.route('/')
-def index():
-    return "Bot de Almacenamiento Online 🚀"
+def index(): return "Bot Activo 🚀"
 
 def wake_up():
-    """Mantiene el bot despierto haciendo peticiones cada 10 min"""
     while True:
-        try:
-            # Auto-visita
-            response = requests.get(RENDER_URL)
-            logging.info(f"Auto-despertador: Estado {response.status_code}")
-        except Exception as e:
-            logging.warning(f"Auto-despertador: No se pudo contactar al servidor: {e}")
-        time.sleep(600) # 10 minutos
+        try: requests.get(RENDER_URL)
+        except: pass
+        time.sleep(600)
 
-def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
-
-# -----------------------------
-# 6. INICIO
-# -----------------------------
 if __name__ == "__main__":
-    # Iniciar Servidor Flask en segundo plano
-    Thread(target=run_web, daemon=True).start()
-    
-    # Iniciar el sistema que evita que el bot se duerma
+    init_db() # Crea la tabla si no existe
+    Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080))), daemon=True).start()
     Thread(target=wake_up, daemon=True).start()
-
-    logging.info("Bot iniciado con éxito y sistema anti-suspensión")
-    
-    # Infinity polling optimizado
+    logging.info("Bot iniciado con contador y base de datos")
     bot.infinity_polling(timeout=60, long_polling_timeout=20)
