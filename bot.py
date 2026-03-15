@@ -8,7 +8,6 @@ from psycopg2 import pool
 from flask import Flask
 from threading import Thread, Timer
 from queue import Queue
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ==============================
 # 1. CONFIGURACIÓN
@@ -18,6 +17,7 @@ CHANNEL_ID = int(os.environ.get("CHANNEL_ID", -1003628952931))
 DB_URL = os.environ.get("DATABASE_URL")
 RENDER_URL = "https://telegram-storage-bot-y9pu.onrender.com"
 
+# Bot con alta capacidad de respuesta
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=150)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -39,40 +39,36 @@ except Exception as e:
 # ==============================
 file_queue = Queue()
 batch_data = {}
-timers = {} # Para manejar el informe automático
+timers = {}
 
 def get_stats(user_id):
     if user_id not in batch_data:
-        batch_data[user_id] = {"ok": 0, "dup": 0, "fail": 0, "last_link": None, "active": False}
+        batch_data[user_id] = {"ok": 0, "dup": 0, "fail": 0}
     return batch_data[user_id]
 
 # ==============================
-# 4. FUNCIÓN DEL INFORME FINAL
+# 4. FUNCIÓN DEL INFORME FINAL (AUTOMÁTICO)
 # ==============================
 def send_final_report(user_id):
     stats = batch_data.get(user_id)
     if not stats or (stats["ok"] == 0 and stats["dup"] == 0 and stats["fail"] == 0):
         return
 
-    text = (f"🏁 *INFORME FINAL DE CARGA*\n"
+    text = (f"🏁 *INFORME DE CARGA FINALIZADA*\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ *Nuevos guardados:* `{stats['ok']}`\n"
-            f"⚠️ *Duplicados eliminados:* `{stats['dup']}`\n"
-            f"❌ *Errores detectados:* `{stats['fail']}`\n"
+            f"✅ *Nuevos almacenados:* `{stats['ok']}`\n"
+            f"⚠️ *Duplicados omitidos:* `{stats['dup']}`\n"
+            f"❌ *Errores en proceso:* `{stats['fail']}`\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
-            f"✨ _El chat ha sido limpiado por completo._")
+            f"👤 _Autoría eliminada y chat limpio._")
     
-    markup = InlineKeyboardMarkup()
-    if stats["last_link"]:
-        markup.add(InlineKeyboardButton("📂 Ir al último video", url=stats["last_link"]))
+    bot.send_message(user_id, text, parse_mode="Markdown")
     
-    bot.send_message(user_id, text, reply_markup=markup, parse_mode="Markdown")
-    
-    # Reiniciar estadísticas para el siguiente lote después del informe
-    batch_data[user_id] = {"ok": 0, "dup": 0, "fail": 0, "last_link": None, "active": False}
+    # Reiniciar estadísticas para el próximo envío
+    batch_data[user_id] = {"ok": 0, "dup": 0, "fail": 0}
 
 # ==============================
-# 5. TRABAJADOR Y PROCESAMIENTO
+# 5. TRABAJADOR DE COLA (WORKER)
 # ==============================
 def worker():
     while True:
@@ -88,16 +84,15 @@ Thread(target=worker, daemon=True).start()
 def process_message(message):
     user_id = message.chat.id
     stats = get_stats(user_id)
-    stats["active"] = True
 
-    # Reiniciar el temporizador cada vez que llega un mensaje
+    # Temporizador: envía informe tras 20 segundos de inactividad
     if user_id in timers:
         timers[user_id].cancel()
     
-    # El bot esperará 20 segundos de silencio para enviar el informe
     timers[user_id] = Timer(20.0, send_final_report, [user_id])
     timers[user_id].start()
 
+    # Identificar media
     media = None
     if message.content_type == 'photo': media = message.photo[-1]
     elif message.content_type == 'video': media = message.video
@@ -106,37 +101,36 @@ def process_message(message):
 
     if not media: return
 
-    # Verificar Duplicado
     conn = None
     try:
         conn = db_pool.getconn()
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM storage WHERE file_unique_id = %s", (media.file_unique_id,))
-        exists = cur.fetchone()
         
-        if exists:
+        if cur.fetchone():
             stats["dup"] += 1
-            bot.delete_message(user_id, message.message_id)
         else:
-            # Reenvío Directo
-            sent = bot.forward_message(CHANNEL_ID, user_id, message.message_id)
+            # COPY_MESSAGE: Envía el archivo sin la etiqueta de "Reenviado"
+            bot.copy_message(
+                chat_id=CHANNEL_ID,
+                from_chat_id=user_id,
+                message_id=message.message_id
+            )
             cur.execute("INSERT INTO storage (file_unique_id) VALUES (%s)", (media.file_unique_id,))
             conn.commit()
-            
             stats["ok"] += 1
-            channel_id_str = str(CHANNEL_ID).replace("-100", "")
-            stats["last_link"] = f"https://t.me/c/{channel_id_str}/{sent.message_id}"
             
-            bot.delete_message(user_id, message.message_id)
+        # Borrado inmediato del mensaje original para limpiar el chat
+        bot.delete_message(user_id, message.message_id)
             
     except Exception as e:
-        logging.error(f"Fallo: {e}")
+        logging.error(f"Fallo al procesar: {e}")
         stats["fail"] += 1
     finally:
         if conn: db_pool.putconn(conn)
 
 # ==============================
-# 6. COMANDOS Y WEB
+# 6. COMANDOS Y SERVIDOR
 # ==============================
 @bot.message_handler(commands=['reset'])
 def reset_all(message):
@@ -145,7 +139,7 @@ def reset_all(message):
     cur.execute("DELETE FROM storage")
     conn.commit()
     db_pool.putconn(conn)
-    bot.reply_to(message, "♻️ Base de datos vaciada. Listo para nueva carga.")
+    bot.reply_to(message, "♻️ Base de datos reiniciada. Todo listo para empezar de cero.")
 
 @bot.message_handler(content_types=['photo', 'video', 'document', 'audio', 'voice', 'video_note'])
 def handle_docs(message):
@@ -153,7 +147,7 @@ def handle_docs(message):
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Bot con Informe Final Activo 🚀"
+def home(): return "Bot de Almacenamiento Limpio Activo 🚀"
 
 if __name__ == "__main__":
     Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080))), daemon=True).start()
