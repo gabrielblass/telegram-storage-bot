@@ -2,6 +2,7 @@ import telebot
 import os
 import time
 import logging
+import requests  # Librería para el sistema anti-suspensión
 from flask import Flask
 from threading import Thread
 
@@ -10,6 +11,8 @@ from threading import Thread
 # -----------------------------
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHANNEL_ID = int(os.environ.get("CHANNEL_ID", -1003628952931))
+# Tu enlace de Render para que el bot se visite a sí mismo
+RENDER_URL = "https://telegram-storage-bot-y9pu.onrender.com"
 
 bot = telebot.TeleBot(TOKEN)
 
@@ -85,13 +88,24 @@ def media_handler(message):
     ).start()
 
 # -----------------------------
-# 5. SERVIDOR WEB (PARA RENDER)
+# 5. SERVIDOR WEB Y ANTI-SUSPENSIÓN
 # -----------------------------
 app = Flask(__name__)
 
 @app.route('/')
 def index():
     return "Bot de Almacenamiento Online 🚀"
+
+def wake_up():
+    """Mantiene el bot despierto haciendo peticiones cada 10 min"""
+    while True:
+        try:
+            # Auto-visita
+            response = requests.get(RENDER_URL)
+            logging.info(f"Auto-despertador: Estado {response.status_code}")
+        except Exception as e:
+            logging.warning(f"Auto-despertador: No se pudo contactar al servidor: {e}")
+        time.sleep(600) # 10 minutos
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
@@ -101,10 +115,13 @@ def run_web():
 # 6. INICIO
 # -----------------------------
 if __name__ == "__main__":
-    # Servidor Flask en segundo plano
+    # Iniciar Servidor Flask en segundo plano
     Thread(target=run_web, daemon=True).start()
+    
+    # Iniciar el sistema que evita que el bot se duerma
+    Thread(target=wake_up, daemon=True).start()
 
-    logging.info("Bot iniciado con éxito")
+    logging.info("Bot iniciado con éxito y sistema anti-suspensión")
     
     # Infinity polling optimizado
     bot.infinity_polling(timeout=60, long_polling_timeout=20)
