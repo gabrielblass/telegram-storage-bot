@@ -16,60 +16,72 @@ DB_URL = os.getenv("DATABASE_URL")
 if not TOKEN or not DB_URL:
     raise ValueError("Faltan variables de entorno (TOKEN o DATABASE_URL)")
 
-bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=30)
+# Ajuste de hilos para estabilidad en Render
+bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=40)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# Pool de conexiones (MUCHO más rápido)
-db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DB_URL)
-
-db_lock = Lock()
+# Pool de conexiones optimizado
+try:
+    db_pool = psycopg2.pool.SimpleConnectionPool(1, 20, DB_URL)
+    logging.info("✅ Pool de conexiones DB iniciado")
+except Exception as e:
+    logging.error(f"❌ Error al iniciar pool DB: {e}")
 
 # ==============================
 # 2. VARIABLES DE CONTROL
 # ==============================
 batch_data = {}
 timers = {}
+stats_lock = Lock() # Para evitar errores al escribir estadísticas simultáneas
 
 def get_stats(chat_id):
-    if chat_id not in batch_data:
-        batch_data[chat_id] = {"ok": 0, "dup": 0, "fail": 0}
-    return batch_data[chat_id]
+    with stats_lock:
+        if chat_id not in batch_data:
+            batch_data[chat_id] = {"ok": 0, "dup": 0, "fail": 0}
+        return batch_data[chat_id]
 
 # ==============================
-# 3. BASE DE DATOS (OPTIMIZADA)
+# 3. BASE DE DATOS (LÓGICA INVERSA)
 # ==============================
-def is_duplicate_and_save(file_id):
+def check_only(file_id):
+    """Solo verifica si existe sin insertar todavía"""
     conn = None
     try:
         conn = db_pool.getconn()
         cur = conn.cursor()
+        cur.execute("SELECT 1 FROM storage WHERE file_unique_id = %s", (file_id,))
+        exists = cur.fetchone() is not None
+        cur.close()
+        return exists
+    except Exception as e:
+        logging.error(f"Error verificando DB: {e}")
+        return False
+    finally:
+        if conn: db_pool.putconn(conn)
 
-        # 🔥 IMPORTANTE: usar UNIQUE en la DB
-        cur.execute(
-            "INSERT INTO storage (file_unique_id) VALUES (%s)",
-            (file_id,)
-        )
+def save_id(file_id):
+    """Guarda el ID después de confirmar el envío exitoso"""
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO storage (file_unique_id) VALUES (%s)", (file_id,))
         conn.commit()
         cur.close()
-        return False
-
-    except errors.UniqueViolation:
-        conn.rollback()
         return True
-
-    except Exception as e:
-        logging.error(f"DB Error: {e}")
-        if conn:
-            conn.rollback()
+    except errors.UniqueViolation:
+        if conn: conn.rollback()
         return False
-
+    except Exception as e:
+        logging.error(f"Error guardando en DB: {e}")
+        if conn: conn.rollback()
+        return False
     finally:
-        if conn:
-            db_pool.putconn(conn)
+        if conn: db_pool.putconn(conn)
 
 # ==============================
 # 4. INFORME FINAL
@@ -82,10 +94,11 @@ def send_final_report(chat_id):
     text = (
         f"🏁 *INFORME DE CARGA FINALIZADA*\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ *Nuevos:* `{stats['ok']}`\n"
+        f"✅ *Guardados:* `{stats['ok']}`\n"
         f"⚠️ *Duplicados:* `{stats['dup']}`\n"
-        f"❌ *Errores:* `{stats['fail']}`\n"
-        f"━━━━━━━━━━━━━━━━━━━"
+        f"❌ *Fallidos:* `{stats['fail']}`\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 _Autoría eliminada y chat limpio._"
     )
 
     try:
@@ -93,8 +106,9 @@ def send_final_report(chat_id):
     except Exception as e:
         logging.error(f"Error enviando reporte: {e}")
 
-    batch_data[chat_id] = {"ok": 0, "dup": 0, "fail": 0}
-    timers.pop(chat_id, None)
+    with stats_lock:
+        batch_data[chat_id] = {"ok": 0, "dup": 0, "fail": 0}
+        timers.pop(chat_id, None)
 
 # ==============================
 # 5. MANEJADOR PRINCIPAL
@@ -104,15 +118,15 @@ def handle_docs(message):
     chat_id = message.chat.id
     stats = get_stats(chat_id)
 
-    # Reiniciar temporizador
+    # Reiniciar temporizador (30 segundos para dar margen a videos grandes)
     if chat_id in timers:
         timers[chat_id].cancel()
-
-    timer = Timer(20.0, send_final_report, [chat_id])
+    
+    timer = Timer(30.0, send_final_report, [chat_id])
     timers[chat_id] = timer
     timer.start()
 
-    # Obtener media
+    # Detectar el objeto media
     media = None
     if message.content_type == 'photo':
         media = message.photo[-1]
@@ -122,27 +136,32 @@ def handle_docs(message):
     if not media:
         return
 
-    # Verificar duplicado (sin lock pesado)
-    if is_duplicate_and_save(media.file_unique_id):
+    # 1. VERIFICAR DUPLICADO (Sin insertar aún)
+    if check_only(media.file_unique_id):
         stats["dup"] += 1
         try:
             bot.delete_message(chat_id, message.message_id)
-        except Exception as e:
-            logging.warning(f"No se pudo borrar duplicado: {e}")
+        except: pass
         return
 
-    # Copiar al canal
+    # 2. INTENTAR COPIAR AL CANAL
     try:
+        # copy_message quita la autoría original
         bot.copy_message(CHANNEL_ID, chat_id, message.message_id)
-        stats["ok"] += 1
-
+        
+        # 3. SOLO SI SE COPIÓ, GUARDAMOS EN DB
+        if save_id(media.file_unique_id):
+            stats["ok"] += 1
+        else:
+            # Si falló la DB pero se envió, lo contamos como error de registro pero no duplicado
+            stats["fail"] += 1
+            
         try:
             bot.delete_message(chat_id, message.message_id)
-        except Exception as e:
-            logging.warning(f"No se pudo borrar mensaje: {e}")
+        except: pass
 
     except Exception as e:
-        logging.error(f"Error enviando: {e}")
+        logging.error(f"Fallo al mover archivo: {e}")
         stats["fail"] += 1
 
 # ==============================
@@ -152,15 +171,18 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot Anti-Duplicados Activo 🛡️"
+    return "Bot Safe-Storage Online 🛡️"
+
+def run_flask():
+    port = int(os.getenv("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 
 # ==============================
 # 7. ARRANQUE
 # ==============================
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
-
 if __name__ == "__main__":
     Thread(target=run_flask, daemon=True).start()
     logging.info("🚀 Bot iniciado correctamente...")
-    bot.infinity_polling(timeout=60, long_polling_timeout=60)
+    
+    # infinity_polling es más resistente a caídas de red
+    bot.infinity_polling(timeout=90, long_polling_timeout=30)
