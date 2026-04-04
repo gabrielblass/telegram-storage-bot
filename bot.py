@@ -48,7 +48,7 @@ def alert_admin(message):
         logging.error(f"Error alert_admin: {e}")
 
 # ==============================
-# 3. BASE DE DATOS OPTIMIZADA (ANTI-DUPLICADOS)
+# 3. BASE DE DATOS (ANTI-DUPLICADOS)
 # ==============================
 def process_db(file_id):
     conn = None
@@ -140,8 +140,27 @@ def handle_docs(message):
     if not media:
         return
 
+    caption = message.caption if message.caption else None
+
     try:
-        bot.forward_message(CHANNEL_ID, cid, message.message_id)
+        # 🔥 ENVÍO SIN "REENVIADO DE"
+        if message.content_type == 'photo':
+            bot.send_photo(CHANNEL_ID, media.file_id, caption=caption)
+
+        elif message.content_type == 'video':
+            bot.send_video(CHANNEL_ID, media.file_id, caption=caption)
+
+        elif message.content_type == 'document':
+            bot.send_document(CHANNEL_ID, media.file_id, caption=caption)
+
+        elif message.content_type == 'audio':
+            bot.send_audio(CHANNEL_ID, media.file_id, caption=caption)
+
+        elif message.content_type == 'voice':
+            bot.send_voice(CHANNEL_ID, media.file_id)
+
+        elif message.content_type == 'video_note':
+            bot.send_video_note(CHANNEL_ID, media.file_id)
 
         status = process_db(media.file_unique_id)
 
@@ -156,21 +175,21 @@ def handle_docs(message):
         bot.delete_message(cid, message.message_id)
 
     except Exception as e:
-        logging.error(f"Fallo Reenvío: {e}")
+        logging.error(f"Fallo envío: {e}")
 
         with stats_lock:
             batch_data[cid]["fail"] += 1
 
-        alert_admin(f"⚠️ *FALLO DE REENVÍO*\n`{str(e)[:60]}`")
+        alert_admin(f"⚠️ *FALLO DE ENVÍO*\n`{str(e)[:60]}`")
 
 # ==============================
-# 5. AUTO-DESPERTADOR (KEEP-ALIVE)
+# 5. KEEP ALIVE
 # ==============================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "🛡️ MONITOR DE ALMACENAMIENTO ACTIVO"
+    return "🛡️ MONITOR ACTIVO"
 
 def health_monitor():
     while True:
@@ -193,7 +212,7 @@ def health_monitor():
 # 6. INICIO
 # ==============================
 if __name__ == "__main__":
-    alert_admin("🚀 *BOT REINICIADO*\nSistema activo y estable.")
+    alert_admin("🚀 *BOT REINICIADO*\nSin 'reenviado de' activo.")
 
     Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080))), daemon=True).start()
     Thread(target=health_monitor, daemon=True).start()
