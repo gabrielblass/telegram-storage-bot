@@ -22,13 +22,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 # Pool de conexiones
 db_pool = None
+pool_lock = Lock()
+
 def init_pool():
     global db_pool
-    try:
-        db_pool = psycopg2.pool.SimpleConnectionPool(1, 50, DB_URL)
-        return True
-    except Exception as e:
-        return str(e)
+    with pool_lock:
+        if db_pool:
+            return True
+        try:
+            db_pool = psycopg2.pool.SimpleConnectionPool(1, 50, DB_URL)
+            return True
+        except Exception as e:
+            logging.error(f"Error creando pool: {e}")
+            return False
 
 init_pool()
 
@@ -38,43 +44,55 @@ init_pool()
 def alert_admin(message):
     try:
         bot.send_message(ADMIN_ID, message, parse_mode="Markdown")
-    except:
-        pass
+    except Exception as e:
+        logging.error(f"Error alert_admin: {e}")
 
 # ==============================
 # 3. BASE DE DATOS OPTIMIZADA (ANTI-DUPLICADOS)
 # ==============================
 def process_db(file_id):
-    """
-    Retorna: 'ok' si se guardó, 'dup' si ya existía, 'err' si falló la conexión
-    """
     conn = None
     try:
-        if not db_pool: init_pool()
+        if not db_pool:
+            if not init_pool():
+                return "err"
+
         conn = db_pool.getconn()
         cur = conn.cursor()
-        
-        # Intentar insertar directamente
+
         try:
             cur.execute("INSERT INTO storage (file_unique_id) VALUES (%s)", (file_id,))
             conn.commit()
-            cur.close()
             return "ok"
+
         except errors.UniqueViolation:
             conn.rollback()
+            return "dup"
+
+        finally:
             cur.close()
-            return "dup" # Es un duplicado normal, no es error
-            
+
     except Exception as e:
         err_msg = str(e)
-        # Solo alertar si NO es un problema de duplicados
+
         if "unique" not in err_msg.lower():
             logging.error(f"Fallo DB Real: {e}")
-            alert_admin(f"🚨 *FALLO DB REAL*\nLa base de datos no responde.\n`{err_msg[:60]}`")
-        if conn: conn.rollback()
+            alert_admin(f"🚨 *FALLO DB REAL*\n`{err_msg[:60]}`")
+
+        if conn:
+            try:
+                conn.rollback()
+            except:
+                pass
+
         return "err"
+
     finally:
-        if conn: db_pool.putconn(conn)
+        if conn and db_pool:
+            try:
+                db_pool.putconn(conn)
+            except:
+                pass
 
 # ==============================
 # 4. MANEJADOR Y REPORTES
@@ -84,85 +102,100 @@ timers = {}
 stats_lock = Lock()
 
 def send_final_report(chat_id):
-    stats = batch_data.get(chat_id)
-    if not stats or all(v == 0 for v in stats.values()): return
-
-    text = (f"🏁 *INFORME DE CARGA FINALIZADA*\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ *Guardados:* `{stats['ok']}`\n"
-            f"⚠️ *Duplicados:* `{stats['dup']}`\n"
-            f"❌ *Fallidos:* `{stats['fail']}`\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 _Chat limpio y autoría eliminada._")
-    
-    try: bot.send_message(chat_id, text, parse_mode="Markdown")
-    except: pass
-    
     with stats_lock:
+        stats = batch_data.get(chat_id)
+        if not stats or all(v == 0 for v in stats.values()):
+            return
+
+        text = (f"🏁 *INFORME DE CARGA FINALIZADA*\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"✅ *Guardados:* `{stats['ok']}`\n"
+                f"⚠️ *Duplicados:* `{stats['dup']}`\n"
+                f"❌ *Fallidos:* `{stats['fail']}`\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 _Chat limpio y autoría eliminada._")
+
+        try:
+            bot.send_message(chat_id, text, parse_mode="Markdown")
+        except Exception as e:
+            logging.error(f"Error enviando reporte: {e}")
+
         batch_data[chat_id] = {"ok": 0, "dup": 0, "fail": 0}
 
 @bot.message_handler(content_types=['photo', 'video', 'document', 'audio', 'voice', 'video_note'])
 def handle_docs(message):
     cid = message.chat.id
-    
+
     with stats_lock:
         if cid not in batch_data:
             batch_data[cid] = {"ok": 0, "dup": 0, "fail": 0}
 
-    # Temporizador de reporte
-    if cid in timers: timers[cid].cancel()
+    if cid in timers:
+        timers[cid].cancel()
+
     timers[cid] = Timer(25.0, send_final_report, [cid])
     timers[cid].start()
 
-    # Detectar media
     media = message.photo[-1] if message.content_type == 'photo' else getattr(message, message.content_type, None)
-    if not media: return
+    if not media:
+        return
 
-    # 1. Intentar reenvío primero (Para no perder el video)
     try:
         bot.forward_message(CHANNEL_ID, cid, message.message_id)
-        
-        # 2. Verificar duplicado y registrar
-        status = process_db(media.file_unique_id)
-        
-        if status == "ok":
-            batch_data[cid]["ok"] += 1
-        elif status == "dup":
-            batch_data[cid]["dup"] += 1
-        else:
-            batch_data[cid]["fail"] += 1
 
-        # 3. Limpiar chat
+        status = process_db(media.file_unique_id)
+
+        with stats_lock:
+            if status == "ok":
+                batch_data[cid]["ok"] += 1
+            elif status == "dup":
+                batch_data[cid]["dup"] += 1
+            else:
+                batch_data[cid]["fail"] += 1
+
         bot.delete_message(cid, message.message_id)
 
     except Exception as e:
         logging.error(f"Fallo Reenvío: {e}")
-        batch_data[cid]["fail"] += 1
-        alert_admin(f"⚠️ *FALLO DE REENVÍO*\nError: `{str(e)[:60]}`")
+
+        with stats_lock:
+            batch_data[cid]["fail"] += 1
+
+        alert_admin(f"⚠️ *FALLO DE REENVÍO*\n`{str(e)[:60]}`")
 
 # ==============================
 # 5. AUTO-DESPERTADOR (KEEP-ALIVE)
 # ==============================
 app = Flask(__name__)
+
 @app.route('/')
-def home(): return "🛡️ MONITOR DE ALMACENAMIENTO ACTIVO"
+def home():
+    return "🛡️ MONITOR DE ALMACENAMIENTO ACTIVO"
 
 def health_monitor():
     while True:
-        time.sleep(120) # Cada 2 minutos (más rápido para Neon)
+        time.sleep(120)
         if MY_URL:
             try:
                 requests.get(MY_URL, timeout=10)
-                # Tocar la DB para que Neon no se duerma
-                conn = db_pool.getconn()
-                cur = conn.cursor()
-                cur.execute("SELECT 1")
-                cur.close()
-                db_pool.putconn(conn)
-            except: pass
 
+                if db_pool:
+                    conn = db_pool.getconn()
+                    cur = conn.cursor()
+                    cur.execute("SELECT 1")
+                    cur.close()
+                    db_pool.putconn(conn)
+
+            except Exception as e:
+                logging.warning(f"Health check fallo: {e}")
+
+# ==============================
+# 6. INICIO
+# ==============================
 if __name__ == "__main__":
-    alert_admin("🚀 *BOT REINICIADO*\nLógica anti-duplicados corregida. Listo para recibir videos.")
+    alert_admin("🚀 *BOT REINICIADO*\nSistema activo y estable.")
+
     Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080))), daemon=True).start()
     Thread(target=health_monitor, daemon=True).start()
-    bot.infinity_polling(timeout=90, long_polling_timeout=30)
+
+    bot.infinity_polling(timeout=60, long_polling_timeout=25)
