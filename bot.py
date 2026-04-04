@@ -125,15 +125,15 @@ def send_final_report(chat_id):
             return
 
         text = (
-            f"🏁 *REPORTE FINAL*\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"✅ {stats['ok']}\n"
-            f"⚠️ {stats['dup']}\n"
-            f"❌ {stats['fail']}"
+            "<b>REPORTE FINAL</b>\n"
+            "━━━━━━━━━━━━━━\n"
+            f"<b>Guardados:</b> {stats['ok']}\n"
+            f"<b>Duplicados:</b> {stats['dup']}\n"
+            f"<b>Fallidos:</b> {stats['fail']}"
         )
 
         try:
-            bot.send_message(chat_id, text, parse_mode="Markdown")
+            bot.send_message(chat_id, text, parse_mode="HTML")
         except:
             pass
 
