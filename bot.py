@@ -8,10 +8,9 @@ from psycopg2 import pool, errors
 from flask import Flask
 from threading import Thread, Timer, Lock
 from queue import Queue, Empty
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ==============================
-# CONFIG
+# 1. CONFIGURACIÓN
 # ==============================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003628952931"))
@@ -21,176 +20,199 @@ ADMIN_ID = 1243433271
 
 bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=30)
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # ==============================
-# DB
+# 2. POOL DB SEGURO
 # ==============================
 db_pool = None
-lock = Lock()
+pool_lock = Lock()
 
 def init_pool():
     global db_pool
-    if db_pool: return
-    db_pool = psycopg2.pool.SimpleConnectionPool(1, 50, DB_URL)
+    with pool_lock:
+        if db_pool:
+            return True
+        try:
+            db_pool = psycopg2.pool.SimpleConnectionPool(1, 50, DB_URL)
+            return True
+        except Exception as e:
+            logging.error(f"Error DB pool: {e}")
+            return False
 
 init_pool()
 
-def save_file(file_id, msg_id):
-    conn = db_pool.getconn()
-    cur = conn.cursor()
+# ==============================
+# 3. ALERTAS
+# ==============================
+def alert_admin(msg):
     try:
-        cur.execute(
-            "INSERT INTO storage (file_unique_id, message_id) VALUES (%s,%s)",
-            (file_id, msg_id)
-        )
-        conn.commit()
-        return "ok"
-    except errors.UniqueViolation:
-        conn.rollback()
-        return "dup"
+        bot.send_message(ADMIN_ID, msg, parse_mode="Markdown")
+    except:
+        pass
+
+# ==============================
+# 4. DB (ANTI DUPLICADOS)
+# ==============================
+def process_db(file_id):
+    conn = None
+    try:
+        if not db_pool:
+            if not init_pool():
+                return "err"
+
+        conn = db_pool.getconn()
+        cur = conn.cursor()
+
+        try:
+            cur.execute("INSERT INTO storage (file_unique_id) VALUES (%s)", (file_id,))
+            conn.commit()
+            return "ok"
+        except errors.UniqueViolation:
+            conn.rollback()
+            return "dup"
+        finally:
+            cur.close()
+
+    except Exception as e:
+        if "unique" not in str(e).lower():
+            alert_admin(f"🚨 DB ERROR\n`{str(e)[:60]}`")
+        if conn:
+            try: conn.rollback()
+            except: pass
+        return "err"
+
     finally:
-        cur.close()
-        db_pool.putconn(conn)
-
-def get_file(file_id):
-    conn = db_pool.getconn()
-    cur = conn.cursor()
-    cur.execute("SELECT message_id FROM storage WHERE file_unique_id=%s", (file_id,))
-    row = cur.fetchone()
-    cur.close()
-    db_pool.putconn(conn)
-    return row
+        if conn and db_pool:
+            try: db_pool.putconn(conn)
+            except: pass
 
 # ==============================
-# COLA
+# 5. COLA Y WORKERS
 # ==============================
-queue = Queue()
-failed = Queue()
-stats = {}
+task_queue = Queue(maxsize=1000)
+stats_lock = Lock()
+
+batch_data = {}
 timers = {}
-lock_stats = Lock()
+failed_tasks = Queue()
 
-def build_link(msg_id):
-    cid = str(CHANNEL_ID).replace("-100", "")
-    return f"https://t.me/c/{cid}/{msg_id}"
+def safe_forward(cid, from_chat, msg_id, retries=3):
+    for i in range(retries):
+        try:
+            return bot.forward_message(cid, from_chat, msg_id)
+        except Exception as e:
+            if "RemoteDisconnected" in str(e) or "Connection aborted" in str(e):
+                time.sleep(2 * (i + 1))
+                continue
+            else:
+                raise e
+    return None
 
 def worker():
     while True:
         try:
-            msg = queue.get(timeout=5)
+            message = task_queue.get(timeout=5)
         except Empty:
             continue
 
-        cid = msg.chat.id
-        media = msg.photo[-1] if msg.content_type == 'photo' else getattr(msg, msg.content_type, None)
+        cid = message.chat.id
 
         try:
-            sent = bot.forward_message(CHANNEL_ID, cid, msg.message_id)
+            media = message.photo[-1] if message.content_type == 'photo' else getattr(message, message.content_type, None)
+            if not media:
+                continue
 
-            status = save_file(media.file_unique_id, sent.message_id)
+            result = safe_forward(CHANNEL_ID, cid, message.message_id)
 
-            with lock_stats:
+            if not result:
+                failed_tasks.put(message)
+                with stats_lock:
+                    batch_data[cid]["fail"] += 1
+                continue
+
+            status = process_db(media.file_unique_id)
+
+            with stats_lock:
                 if status == "ok":
-                    stats[cid]["ok"] += 1
-
-                    link = build_link(sent.message_id)
-
-                    kb = InlineKeyboardMarkup()
-                    kb.add(InlineKeyboardButton("📎 Ver archivo", url=link))
-
-                    bot.send_message(cid, "✅ Guardado", reply_markup=kb)
-
+                    batch_data[cid]["ok"] += 1
                 elif status == "dup":
-                    stats[cid]["dup"] += 1
-
+                    batch_data[cid]["dup"] += 1
                 else:
-                    stats[cid]["fail"] += 1
+                    batch_data[cid]["fail"] += 1
 
-            bot.delete_message(cid, msg.message_id)
+            bot.delete_message(cid, message.message_id)
 
         except Exception as e:
-            failed.put(msg)
-            with lock_stats:
-                stats[cid]["fail"] += 1
+            logging.error(f"Worker error: {e}")
+            failed_tasks.put(message)
 
-        queue.task_done()
+        finally:
+            task_queue.task_done()
 
-def retry():
+def retry_failed_worker():
     while True:
         try:
-            m = failed.get(timeout=10)
-        except:
+            msg = failed_tasks.get(timeout=10)
+        except Empty:
             continue
-        time.sleep(5)
-        queue.put(m)
+
+        time.sleep(5)  # espera antes de reintentar
+
+        try:
+            task_queue.put(msg)
+        except:
+            pass
 
 # ==============================
-# REPORTES
+# 6. REPORTES
 # ==============================
-def report(cid):
-    s = stats.get(cid)
-    if not s: return
+def send_final_report(chat_id):
+    with stats_lock:
+        stats = batch_data.get(chat_id)
+        if not stats or all(v == 0 for v in stats.values()):
+            return
 
-    txt = f"""
-🏁 INFORME
-OK: {s['ok']}
-DUP: {s['dup']}
-FAIL: {s['fail']}
-"""
-    bot.send_message(cid, txt)
+        text = (f"🏁 *INFORME DE CARGA FINALIZADA*\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"✅ *Guardados:* `{stats['ok']}`\n"
+                f"⚠️ *Duplicados:* `{stats['dup']}`\n"
+                f"❌ *Fallidos:* `{stats['fail']}`\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 _Chat limpio y autoría eliminada._")
 
-    stats[cid] = {"ok":0,"dup":0,"fail":0}
+        try:
+            bot.send_message(chat_id, text, parse_mode="Markdown")
+        except:
+            pass
+
+        batch_data[chat_id] = {"ok": 0, "dup": 0, "fail": 0}
 
 # ==============================
-# HANDLER
+# 7. HANDLER
 # ==============================
-@bot.message_handler(content_types=['photo','video','document','audio','voice','video_note'])
-def handler(m):
-    cid = m.chat.id
+@bot.message_handler(content_types=['photo', 'video', 'document', 'audio', 'voice', 'video_note'])
+def handle_docs(message):
+    cid = message.chat.id
 
-    with lock_stats:
-        if cid not in stats:
-            stats[cid] = {"ok":0,"dup":0,"fail":0}
+    with stats_lock:
+        if cid not in batch_data:
+            batch_data[cid] = {"ok": 0, "dup": 0, "fail": 0}
 
     if cid in timers:
         timers[cid].cancel()
 
-    timers[cid] = Timer(25, report, [cid])
+    timers[cid] = Timer(25.0, send_final_report, [cid])
     timers[cid].start()
 
-    queue.put(m)
-
-# ==============================
-# COMANDOS
-# ==============================
-@bot.message_handler(commands=['buscar'])
-def buscar(m):
     try:
-        file_id = m.text.split(" ")[1]
-        res = get_file(file_id)
-
-        if not res:
-            bot.reply_to(m, "No encontrado")
-            return
-
-        link = build_link(res[0])
-
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("Abrir", url=link))
-
-        bot.reply_to(m, "Encontrado", reply_markup=kb)
-
+        task_queue.put_nowait(message)
     except:
-        bot.reply_to(m, "Uso: /buscar file_id")
-
-@bot.message_handler(commands=['stats'])
-def stats_cmd(m):
-    s = stats.get(m.chat.id, {})
-    bot.reply_to(m, str(s))
+        with stats_lock:
+            batch_data[cid]["fail"] += 1
 
 # ==============================
-# KEEP ALIVE
+# 8. KEEP ALIVE
 # ==============================
 app = Flask(__name__)
 
@@ -198,25 +220,32 @@ app = Flask(__name__)
 def home():
     return "OK"
 
-def ping():
+def health_monitor():
     while True:
         time.sleep(120)
         try:
             if MY_URL:
-                requests.get(MY_URL)
+                requests.get(MY_URL, timeout=10)
+            if db_pool:
+                conn = db_pool.getconn()
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                cur.close()
+                db_pool.putconn(conn)
         except:
             pass
 
 # ==============================
-# START
+# 9. INICIO
 # ==============================
 if __name__ == "__main__":
+    alert_admin("🚀 BOT PRO ACTIVO")
 
-    for _ in range(10):
+    for _ in range(10):  # workers
         Thread(target=worker, daemon=True).start()
 
-    Thread(target=retry, daemon=True).start()
-    Thread(target=ping, daemon=True).start()
-    Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.getenv("PORT",8080))), daemon=True).start()
+    Thread(target=retry_failed_worker, daemon=True).start()
+    Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080))), daemon=True).start()
+    Thread(target=health_monitor, daemon=True).start()
 
-    bot.infinity_polling()
+    bot.infinity_polling(timeout=60, long_polling_timeout=25)
