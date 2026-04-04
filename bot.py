@@ -120,25 +120,28 @@ timers = {}
 lock = Lock()
 
 def send_final_report(chat_id):
-    with lock:
-        stats = batch_data.get(chat_id)
-        if not stats:
-            return
+    stats = batch_data.get(chat_id)
+    if not stats:
+        return
 
-        text = (
-            f"🏁 *REPORTE FINAL*\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"✅ {stats['ok']}\n"
-            f"⚠️ {stats['dup']}\n"
-            f"❌ {stats['fail']}"
-        )
+    total = stats['ok'] + stats['dup'] + stats['fail']
 
-        try:
-            bot.send_message(chat_id, text, parse_mode="Markdown")
-        except:
-            pass
+    text = (
+        "╭━━━ 📊 *RESULTADO DEL PROCESO* ━━━╮\n"
+        f"┃ 📁 Total procesados: *{total}*\n"
+        "┃━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"┃ ✅ Guardados : *{stats['ok']}*\n"
+        f"┃ ♻️ Duplicados: *{stats['dup']}*\n"
+        f"┃ ❌ Fallidos  : *{stats['fail']}*\n"
+        "╰━━━━━━━━━━━━━━━━━━━━━━╯"
+    )
 
-        batch_data[chat_id] = {"ok": 0, "dup": 0, "fail": 0}
+    try:
+        bot.send_message(chat_id, text, parse_mode="Markdown")
+    except:
+        pass
+
+    batch_data[chat_id] = {"ok": 0, "dup": 0, "fail": 0}
 
 # ==============================
 # HANDLER
