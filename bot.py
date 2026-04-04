@@ -9,18 +9,23 @@ from flask import Flask
 from threading import Thread, Timer, Lock
 
 # ==============================
-# 1. CONFIGURACIÓN
+# CONFIG
 # ==============================
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003628952931"))
 DB_URL = os.getenv("DATABASE_URL")
-MY_URL = os.getenv("RENDER_EXTERNAL_URL") 
-ADMIN_ID = 1243433271 
+MY_URL = os.getenv("RENDER_EXTERNAL_URL")
 
-bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=100)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=20)
 
-# Pool de conexiones
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+
+# ==============================
+# DB POOL
+# ==============================
 db_pool = None
 pool_lock = Lock()
 
@@ -30,162 +35,178 @@ def init_pool():
         if db_pool:
             return True
         try:
-            db_pool = psycopg2.pool.SimpleConnectionPool(1, 50, DB_URL)
+            db_pool = psycopg2.pool.SimpleConnectionPool(1, 20, DB_URL)
+            logging.info("DB Pool iniciado")
             return True
         except Exception as e:
             logging.error(f"Error creando pool: {e}")
             return False
 
+def get_conn():
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return conn
+    except:
+        logging.warning("Conexión inválida, reiniciando pool...")
+        init_pool()
+        return db_pool.getconn()
+
 init_pool()
 
 # ==============================
-# 2. SISTEMA DE ALERTAS
-# ==============================
-def alert_admin(message):
-    try:
-        bot.send_message(ADMIN_ID, message, parse_mode="Markdown")
-    except Exception as e:
-        logging.error(f"Error alert_admin: {e}")
-
-# ==============================
-# 3. BASE DE DATOS (ANTI-DUPLICADOS)
+# DB
 # ==============================
 def process_db(file_id):
+    if not file_id:
+        return "err"
+
     conn = None
     try:
-        if not db_pool:
-            if not init_pool():
-                return "err"
-
-        conn = db_pool.getconn()
-        cur = conn.cursor()
-
-        try:
-            cur.execute("INSERT INTO storage (file_unique_id) VALUES (%s)", (file_id,))
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO storage (file_unique_id) VALUES (%s)",
+                (file_id,)
+            )
             conn.commit()
             return "ok"
-        except errors.UniqueViolation:
-            conn.rollback()
-            return "dup"
-        finally:
-            cur.close()
+
+    except errors.UniqueViolation:
+        conn.rollback()
+        return "dup"
 
     except Exception as e:
-        err_msg = str(e)
-        if "unique" not in err_msg.lower():
-            logging.error(f"Fallo DB Real: {e}")
-            alert_admin(f"🚨 *FALLO DB REAL*\n`{err_msg[:60]}`")
         if conn:
-            try: conn.rollback()
-            except: pass
+            conn.rollback()
+        logging.error(f"DB error: {e}")
         return "err"
+
     finally:
-        if conn and db_pool:
-            try: db_pool.putconn(conn)
-            except: pass
+        if conn:
+            db_pool.putconn(conn)
 
 # ==============================
-# 4. MANEJADOR Y REPORTES
+# SAFE COPY (ANTI FLOOD REAL)
+# ==============================
+def safe_copy(chat_id, message_id, caption):
+    for attempt in range(5):
+        try:
+            return bot.copy_message(
+                CHANNEL_ID,
+                chat_id,
+                message_id,
+                caption=caption
+            )
+
+        except telebot.apihelper.ApiTelegramException as e:
+            if e.error_code == 429:
+                wait = e.result_json.get("parameters", {}).get("retry_after", 5)
+                logging.warning(f"Flood → esperando {wait}s")
+                time.sleep(wait + 1)
+            else:
+                logging.warning(f"Error intento {attempt+1}: {e}")
+                time.sleep(2)
+
+    raise Exception("Falló copy tras 5 intentos")
+
+# ==============================
+# STATS
 # ==============================
 batch_data = {}
 timers = {}
-stats_lock = Lock()
+lock = Lock()
 
 def send_final_report(chat_id):
-    with stats_lock:
+    with lock:
         stats = batch_data.get(chat_id)
-        if not stats or all(v == 0 for v in stats.values()):
+        if not stats:
             return
 
-        text = (f"🏁 *INFORME DE CARGA FINALIZADA*\n"
-                f"━━━━━━━━━━━━━━━━━━━\n"
-                f"✅ *Guardados:* `{stats['ok']}`\n"
-                f"⚠️ *Duplicados:* `{stats['dup']}`\n"
-                f"❌ *Fallidos:* `{stats['fail']}`\n"
-                f"━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 _Chat limpio y autoría eliminada._")
+        text = (
+            f"🏁 *REPORTE FINAL*\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"✅ {stats['ok']}\n"
+            f"⚠️ {stats['dup']}\n"
+            f"❌ {stats['fail']}"
+        )
 
         try:
             bot.send_message(chat_id, text, parse_mode="Markdown")
-        except Exception as e:
-            logging.error(f"Error enviando reporte: {e}")
+        except:
+            pass
 
         batch_data[chat_id] = {"ok": 0, "dup": 0, "fail": 0}
 
-@bot.message_handler(content_types=['photo', 'video', 'document', 'audio', 'voice', 'video_note'])
-def handle_docs(message):
+# ==============================
+# HANDLER
+# ==============================
+@bot.message_handler(content_types=[
+    'photo','video','document','audio','voice','video_note'
+])
+def handle(message):
     cid = message.chat.id
 
-    with stats_lock:
-        if cid not in batch_data:
-            batch_data[cid] = {"ok": 0, "dup": 0, "fail": 0}
+    with lock:
+        batch_data.setdefault(cid, {"ok": 0, "dup": 0, "fail": 0})
 
     if cid in timers:
         timers[cid].cancel()
 
-    timers[cid] = Timer(25.0, send_final_report, [cid])
+    timers[cid] = Timer(30, send_final_report, [cid])
     timers[cid].start()
 
-    # Identificar el objeto media para obtener el file_unique_id
-    media = message.photo[-1] if message.content_type == 'photo' else getattr(message, message.content_type, None)
+    media = (
+        message.photo[-1] if message.content_type == 'photo'
+        else getattr(message, message.content_type, None)
+    )
+
     if not media:
         return
 
     try:
-        # 🔥 EL CAMBIO CLAVE: copy_message
-        # Clona el mensaje al canal. Es mucho más rápido y estable.
-        # Quita el "Reenviado de..." y usa el nombre del Bot.
-        bot.copy_message(CHANNEL_ID, cid, message.message_id, caption=message.caption)
+        # 1 copiar
+        safe_copy(cid, message.message_id, message.caption)
 
-        status = process_db(media.file_unique_id)
+        # 2 guardar
+        status = process_db(getattr(media, "file_unique_id", None))
 
-        with stats_lock:
-            if status == "ok":
-                batch_data[cid]["ok"] += 1
-            elif status == "dup":
-                batch_data[cid]["dup"] += 1
-            else:
-                batch_data[cid]["fail"] += 1
+        with lock:
+            batch_data[cid][status if status in ["ok","dup"] else "fail"] += 1
 
-        bot.delete_message(cid, message.message_id)
+        # 3 borrar SOLO si todo ok o dup
+        if status in ["ok", "dup"]:
+            bot.delete_message(cid, message.message_id)
 
     except Exception as e:
-        logging.error(f"Fallo envío: {e}")
-        with stats_lock:
+        logging.error(f"Error total: {e}")
+        with lock:
             batch_data[cid]["fail"] += 1
-        alert_admin(f"⚠️ *FALLO DE ENVÍO*\n`{str(e)[:60]}`")
 
 # ==============================
-# 5. KEEP ALIVE
+# SERVER
 # ==============================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "🛡️ MONITOR ACTIVO"
+    return "BOT ACTIVO"
 
-def health_monitor():
+def keep_alive():
     while True:
-        time.sleep(120)
+        time.sleep(180)
         if MY_URL:
             try:
                 requests.get(MY_URL, timeout=10)
-                if db_pool:
-                    conn = db_pool.getconn()
-                    cur = conn.cursor()
-                    cur.execute("SELECT 1")
-                    cur.close()
-                    db_pool.putconn(conn)
-            except Exception as e:
-                logging.warning(f"Health check fallo: {e}")
+            except:
+                pass
 
 # ==============================
-# 6. INICIO
+# RUN
 # ==============================
 if __name__ == "__main__":
-    alert_admin("🚀 *BOT REINICIADO*\nLógica de clonación activa (Sin errores API).")
-
-    Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080))), daemon=True).start()
-    Thread(target=health_monitor, daemon=True).start()
+    Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080))), daemon=True).start()
+    Thread(target=keep_alive, daemon=True).start()
 
     bot.infinity_polling(timeout=60, long_polling_timeout=25)
