@@ -64,35 +64,25 @@ def process_db(file_id):
             cur.execute("INSERT INTO storage (file_unique_id) VALUES (%s)", (file_id,))
             conn.commit()
             return "ok"
-
         except errors.UniqueViolation:
             conn.rollback()
             return "dup"
-
         finally:
             cur.close()
 
     except Exception as e:
         err_msg = str(e)
-
         if "unique" not in err_msg.lower():
             logging.error(f"Fallo DB Real: {e}")
             alert_admin(f"🚨 *FALLO DB REAL*\n`{err_msg[:60]}`")
-
         if conn:
-            try:
-                conn.rollback()
-            except:
-                pass
-
+            try: conn.rollback()
+            except: pass
         return "err"
-
     finally:
         if conn and db_pool:
-            try:
-                db_pool.putconn(conn)
-            except:
-                pass
+            try: db_pool.putconn(conn)
+            except: pass
 
 # ==============================
 # 4. MANEJADOR Y REPORTES
@@ -136,31 +126,16 @@ def handle_docs(message):
     timers[cid] = Timer(25.0, send_final_report, [cid])
     timers[cid].start()
 
+    # Identificar el objeto media para obtener el file_unique_id
     media = message.photo[-1] if message.content_type == 'photo' else getattr(message, message.content_type, None)
     if not media:
         return
 
-    caption = message.caption if message.caption else None
-
     try:
-        # 🔥 ENVÍO SIN "REENVIADO DE"
-        if message.content_type == 'photo':
-            bot.send_photo(CHANNEL_ID, media.file_id, caption=caption)
-
-        elif message.content_type == 'video':
-            bot.send_video(CHANNEL_ID, media.file_id, caption=caption)
-
-        elif message.content_type == 'document':
-            bot.send_document(CHANNEL_ID, media.file_id, caption=caption)
-
-        elif message.content_type == 'audio':
-            bot.send_audio(CHANNEL_ID, media.file_id, caption=caption)
-
-        elif message.content_type == 'voice':
-            bot.send_voice(CHANNEL_ID, media.file_id)
-
-        elif message.content_type == 'video_note':
-            bot.send_video_note(CHANNEL_ID, media.file_id)
+        # 🔥 EL CAMBIO CLAVE: copy_message
+        # Clona el mensaje al canal. Es mucho más rápido y estable.
+        # Quita el "Reenviado de..." y usa el nombre del Bot.
+        bot.copy_message(CHANNEL_ID, cid, message.message_id, caption=message.caption)
 
         status = process_db(media.file_unique_id)
 
@@ -176,10 +151,8 @@ def handle_docs(message):
 
     except Exception as e:
         logging.error(f"Fallo envío: {e}")
-
         with stats_lock:
             batch_data[cid]["fail"] += 1
-
         alert_admin(f"⚠️ *FALLO DE ENVÍO*\n`{str(e)[:60]}`")
 
 # ==============================
@@ -197,14 +170,12 @@ def health_monitor():
         if MY_URL:
             try:
                 requests.get(MY_URL, timeout=10)
-
                 if db_pool:
                     conn = db_pool.getconn()
                     cur = conn.cursor()
                     cur.execute("SELECT 1")
                     cur.close()
                     db_pool.putconn(conn)
-
             except Exception as e:
                 logging.warning(f"Health check fallo: {e}")
 
@@ -212,7 +183,7 @@ def health_monitor():
 # 6. INICIO
 # ==============================
 if __name__ == "__main__":
-    alert_admin("🚀 *BOT REINICIADO*\nSin 'reenviado de' activo.")
+    alert_admin("🚀 *BOT REINICIADO*\nLógica de clonación activa (Sin errores API).")
 
     Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080))), daemon=True).start()
     Thread(target=health_monitor, daemon=True).start()
