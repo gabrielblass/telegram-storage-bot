@@ -6,7 +6,7 @@ import psycopg2
 import requests
 from psycopg2 import pool
 from flask import Flask
-from threading import Thread, Timer, Lock
+from threading import Thread, Lock
 
 # ==============================
 # CONFIG
@@ -16,7 +16,7 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003628952931"))
 DB_URL = os.getenv("DATABASE_URL")
 MY_URL = os.getenv("RENDER_EXTERNAL_URL")
 
-bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=20)
+bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=40)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 
 # ==============================
-# DB POOL
+# DB POOL (AUMENTADO)
 # ==============================
 db_pool = None
 pool_lock = Lock()
@@ -35,7 +35,7 @@ def init_pool():
         if db_pool:
             return True
         try:
-            db_pool = psycopg2.pool.SimpleConnectionPool(1, 20, DB_URL)
+            db_pool = psycopg2.pool.SimpleConnectionPool(1, 50, DB_URL)
             logging.info("DB Pool iniciado")
             return True
         except Exception as e:
@@ -53,7 +53,7 @@ def get_conn():
 init_pool()
 
 # ==============================
-# DB (OPTIMIZADO 🚀)
+# DB (RÁPIDO)
 # ==============================
 def process_db(file_id):
     if not file_id:
@@ -73,10 +73,7 @@ def process_db(file_id):
             result = cur.fetchone()
             conn.commit()
 
-            if result:
-                return "ok"
-            else:
-                return "dup"
+            return "ok" if result else "dup"
 
     except Exception as e:
         if conn:
@@ -94,30 +91,43 @@ def process_db(file_id):
 def safe_copy(chat_id, message_id, caption):
     for attempt in range(5):
         try:
-            return bot.copy_message(
+            res = bot.copy_message(
                 CHANNEL_ID,
                 chat_id,
                 message_id,
                 caption=caption
             )
+            time.sleep(0.05)  # anti flood
+            return res
 
         except telebot.apihelper.ApiTelegramException as e:
             if e.error_code == 429:
                 wait = e.result_json.get("parameters", {}).get("retry_after", 5)
-                logging.warning(f"Flood → esperando {wait}s")
                 time.sleep(wait + 1)
             else:
-                logging.warning(f"Error intento {attempt+1}: {e}")
                 time.sleep(2)
 
-    raise Exception("Falló copy tras 5 intentos")
+    raise Exception("Falló copy")
 
 # ==============================
-# STATS
+# SISTEMA AUTOMÁTICO
 # ==============================
 batch_data = {}
-timers = {}
+last_activity = {}
 lock = Lock()
+
+INACTIVITY_LIMIT = 8
+
+def monitor_activity():
+    while True:
+        time.sleep(2)
+        now = time.time()
+
+        with lock:
+            for cid in list(last_activity.keys()):
+                if now - last_activity[cid] > INACTIVITY_LIMIT:
+                    send_final_report(cid)
+                    del last_activity[cid]
 
 def send_final_report(chat_id):
     stats = batch_data.get(chat_id)
@@ -144,22 +154,10 @@ def send_final_report(chat_id):
     batch_data[chat_id] = {"ok": 0, "dup": 0, "fail": 0}
 
 # ==============================
-# HANDLER
+# PROCESAMIENTO EN PARALELO 🚀
 # ==============================
-@bot.message_handler(content_types=[
-    'photo','video','document','audio','voice','video_note'
-])
-def handle(message):
+def process_message(message):
     cid = message.chat.id
-
-    with lock:
-        batch_data.setdefault(cid, {"ok": 0, "dup": 0, "fail": 0})
-
-    if cid in timers:
-        timers[cid].cancel()
-
-    timers[cid] = Timer(30, send_final_report, [cid])
-    timers[cid].start()
 
     media = (
         message.photo[-1] if message.content_type == 'photo'
@@ -170,23 +168,35 @@ def handle(message):
         return
 
     try:
-        # 1 copiar (rápido)
         safe_copy(cid, message.message_id, message.caption)
 
-        # 2 verificar DB (optimizado)
         status = process_db(getattr(media, "file_unique_id", None))
 
         with lock:
             batch_data[cid][status if status in ["ok","dup"] else "fail"] += 1
 
-        # 3 borrar si ya se procesó
         if status in ["ok", "dup"]:
             bot.delete_message(cid, message.message_id)
 
     except Exception as e:
-        logging.error(f"Error total: {e}")
+        logging.error(f"Error: {e}")
         with lock:
             batch_data[cid]["fail"] += 1
+
+# ==============================
+# HANDLER
+# ==============================
+@bot.message_handler(content_types=[
+    'photo','video','document','audio','voice','video_note'
+])
+def handle(message):
+    cid = message.chat.id
+
+    with lock:
+        batch_data.setdefault(cid, {"ok": 0, "dup": 0, "fail": 0})
+        last_activity[cid] = time.time()
+
+    Thread(target=process_message, args=(message,)).start()
 
 # ==============================
 # SERVER
@@ -210,14 +220,8 @@ def keep_alive():
 # RUN
 # ==============================
 if __name__ == "__main__":
-    Thread(
-        target=lambda: app.run(
-            host="0.0.0.0",
-            port=int(os.getenv("PORT", 8080))
-        ),
-        daemon=True
-    ).start()
-
+    Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080))), daemon=True).start()
     Thread(target=keep_alive, daemon=True).start()
+    Thread(target=monitor_activity, daemon=True).start()
 
     bot.infinity_polling(timeout=60, long_polling_timeout=25)
