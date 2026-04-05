@@ -7,6 +7,7 @@ import requests
 from psycopg2 import pool
 from flask import Flask
 from threading import Thread, Lock
+from queue import Queue
 
 # ==============================
 # CONFIG
@@ -16,52 +17,22 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003628952931"))
 DB_URL = os.getenv("DATABASE_URL")
 MY_URL = os.getenv("RENDER_EXTERNAL_URL")
 
-bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=40)
+bot = telebot.TeleBot(TOKEN, threaded=True, num_threads=10)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO)
 
 # ==============================
-# DB POOL (AUMENTADO)
+# DB
 # ==============================
-db_pool = None
-pool_lock = Lock()
+db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DB_URL)
 
-def init_pool():
-    global db_pool
-    with pool_lock:
-        if db_pool:
-            return True
-        try:
-            db_pool = psycopg2.pool.SimpleConnectionPool(1, 50, DB_URL)
-            logging.info("DB Pool iniciado")
-            return True
-        except Exception as e:
-            logging.error(f"Error creando pool: {e}")
-            return False
-
-def get_conn():
-    try:
-        return db_pool.getconn()
-    except:
-        logging.warning("Reiniciando pool...")
-        init_pool()
-        return db_pool.getconn()
-
-init_pool()
-
-# ==============================
-# DB (RÁPIDO)
-# ==============================
 def process_db(file_id):
     if not file_id:
         return "err"
 
     conn = None
     try:
-        conn = get_conn()
+        conn = db_pool.getconn()
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO storage (file_unique_id)
@@ -70,10 +41,9 @@ def process_db(file_id):
                 RETURNING file_unique_id
             """, (file_id,))
 
-            result = cur.fetchone()
+            res = cur.fetchone()
             conn.commit()
-
-            return "ok" if result else "dup"
+            return "ok" if res else "dup"
 
     except Exception as e:
         if conn:
@@ -86,59 +56,106 @@ def process_db(file_id):
             db_pool.putconn(conn)
 
 # ==============================
-# SAFE COPY (ANTI FLOOD)
+# SAFE COPY (ULTRA SEGURO)
 # ==============================
 def safe_copy(chat_id, message_id, caption):
-    for attempt in range(5):
+    for _ in range(10):
         try:
-            res = bot.copy_message(
-                CHANNEL_ID,
-                chat_id,
-                message_id,
-                caption=caption
-            )
-            time.sleep(0.05)  # anti flood
-            return res
+            return bot.copy_message(CHANNEL_ID, chat_id, message_id, caption=caption)
 
         except telebot.apihelper.ApiTelegramException as e:
             if e.error_code == 429:
                 wait = e.result_json.get("parameters", {}).get("retry_after", 5)
-                time.sleep(wait + 1)
+                time.sleep(wait + 2)
             else:
                 time.sleep(2)
 
-    raise Exception("Falló copy")
+        except Exception:
+            time.sleep(2)
+
+    return None
 
 # ==============================
-# SISTEMA AUTOMÁTICO
+# COLA (CLAVE 🔥)
 # ==============================
+queue = Queue(maxsize=1000)
+
 batch_data = {}
 last_activity = {}
 lock = Lock()
 
-INACTIVITY_LIMIT = 8
+INACTIVITY = 8
 
-def monitor_activity():
+# ==============================
+# WORKER (PROCESA SIN FALLAR)
+# ==============================
+def worker():
+    while True:
+        message = queue.get()
+
+        try:
+            cid = message.chat.id
+
+            media = (
+                message.photo[-1] if message.content_type == 'photo'
+                else getattr(message, message.content_type, None)
+            )
+
+            if not media:
+                continue
+
+            # copiar
+            res = safe_copy(cid, message.message_id, message.caption)
+
+            if not res:
+                raise Exception("Copy falló")
+
+            # DB
+            status = process_db(getattr(media, "file_unique_id", None))
+
+            with lock:
+                batch_data[cid][status if status in ["ok","dup"] else "fail"] += 1
+
+            # borrar
+            try:
+                bot.delete_message(cid, message.message_id)
+            except:
+                pass
+
+            time.sleep(0.1)  # control de velocidad
+
+        except Exception as e:
+            logging.error(f"Worker error: {e}")
+            with lock:
+                batch_data[cid]["fail"] += 1
+
+        finally:
+            queue.task_done()
+
+# ==============================
+# MONITOR
+# ==============================
+def monitor():
     while True:
         time.sleep(2)
         now = time.time()
 
         with lock:
             for cid in list(last_activity.keys()):
-                if now - last_activity[cid] > INACTIVITY_LIMIT:
-                    send_final_report(cid)
+                if now - last_activity[cid] > INACTIVITY:
+                    send_report(cid)
                     del last_activity[cid]
 
-def send_final_report(chat_id):
-    stats = batch_data.get(chat_id)
+def send_report(cid):
+    stats = batch_data.get(cid)
     if not stats:
         return
 
-    total = stats['ok'] + stats['dup'] + stats['fail']
+    total = sum(stats.values())
 
     text = (
-        "╭━━━ 📊 *RESULTADO DEL PROCESO* ━━━╮\n"
-        f"┃ 📁 Total procesados: *{total}*\n"
+        "╭━━━ 📊 *RESULTADO FINAL* ━━━╮\n"
+        f"┃ 📁 Total: *{total}*\n"
         "┃━━━━━━━━━━━━━━━━━━━━━━\n"
         f"┃ ✅ Guardados : *{stats['ok']}*\n"
         f"┃ ♻️ Duplicados: *{stats['dup']}*\n"
@@ -147,41 +164,11 @@ def send_final_report(chat_id):
     )
 
     try:
-        bot.send_message(chat_id, text, parse_mode="Markdown")
+        bot.send_message(cid, text, parse_mode="Markdown")
     except:
         pass
 
-    batch_data[chat_id] = {"ok": 0, "dup": 0, "fail": 0}
-
-# ==============================
-# PROCESAMIENTO EN PARALELO 🚀
-# ==============================
-def process_message(message):
-    cid = message.chat.id
-
-    media = (
-        message.photo[-1] if message.content_type == 'photo'
-        else getattr(message, message.content_type, None)
-    )
-
-    if not media:
-        return
-
-    try:
-        safe_copy(cid, message.message_id, message.caption)
-
-        status = process_db(getattr(media, "file_unique_id", None))
-
-        with lock:
-            batch_data[cid][status if status in ["ok","dup"] else "fail"] += 1
-
-        if status in ["ok", "dup"]:
-            bot.delete_message(cid, message.message_id)
-
-    except Exception as e:
-        logging.error(f"Error: {e}")
-        with lock:
-            batch_data[cid]["fail"] += 1
+    batch_data[cid] = {"ok": 0, "dup": 0, "fail": 0}
 
 # ==============================
 # HANDLER
@@ -196,7 +183,10 @@ def handle(message):
         batch_data.setdefault(cid, {"ok": 0, "dup": 0, "fail": 0})
         last_activity[cid] = time.time()
 
-    Thread(target=process_message, args=(message,)).start()
+    try:
+        queue.put(message, timeout=5)
+    except:
+        bot.send_message(cid, "⚠️ Cola llena, espera un momento...")
 
 # ==============================
 # SERVER
@@ -205,14 +195,14 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "BOT ACTIVO"
+    return "OK"
 
 def keep_alive():
     while True:
         time.sleep(180)
         if MY_URL:
             try:
-                requests.get(MY_URL, timeout=10)
+                requests.get(MY_URL)
             except:
                 pass
 
@@ -220,8 +210,11 @@ def keep_alive():
 # RUN
 # ==============================
 if __name__ == "__main__":
-    Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080))), daemon=True).start()
-    Thread(target=keep_alive, daemon=True).start()
-    Thread(target=monitor_activity, daemon=True).start()
+    for _ in range(5):  # 5 workers controlados
+        Thread(target=worker, daemon=True).start()
 
-    bot.infinity_polling(timeout=60, long_polling_timeout=25)
+    Thread(target=monitor, daemon=True).start()
+    Thread(target=keep_alive, daemon=True).start()
+    Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080))), daemon=True).start()
+
+    bot.infinity_polling()
