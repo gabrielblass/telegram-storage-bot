@@ -56,7 +56,7 @@ def process_db(file_id):
             db_pool.putconn(conn)
 
 # ==============================
-# SAFE COPY (ULTRA SEGURO)
+# SAFE COPY
 # ==============================
 def safe_copy(chat_id, message_id, caption):
     for _ in range(10):
@@ -76,22 +76,28 @@ def safe_copy(chat_id, message_id, caption):
     return None
 
 # ==============================
-# COLA (CLAVE 🔥)
+# COLA Y CONTROL
 # ==============================
 queue = Queue(maxsize=1000)
 
 batch_data = {}
 last_activity = {}
+processing_count = 0
 lock = Lock()
 
 INACTIVITY = 8
 
 # ==============================
-# WORKER (PROCESA SIN FALLAR)
+# WORKER
 # ==============================
 def worker():
+    global processing_count
+
     while True:
         message = queue.get()
+
+        with lock:
+            processing_count += 1
 
         try:
             cid = message.chat.id
@@ -104,25 +110,22 @@ def worker():
             if not media:
                 continue
 
-            # copiar
             res = safe_copy(cid, message.message_id, message.caption)
 
             if not res:
                 raise Exception("Copy falló")
 
-            # DB
             status = process_db(getattr(media, "file_unique_id", None))
 
             with lock:
                 batch_data[cid][status if status in ["ok","dup"] else "fail"] += 1
 
-            # borrar
             try:
                 bot.delete_message(cid, message.message_id)
             except:
                 pass
 
-            time.sleep(0.1)  # control de velocidad
+            time.sleep(0.1)
 
         except Exception as e:
             logging.error(f"Worker error: {e}")
@@ -130,10 +133,12 @@ def worker():
                 batch_data[cid]["fail"] += 1
 
         finally:
+            with lock:
+                processing_count -= 1
             queue.task_done()
 
 # ==============================
-# MONITOR
+# MONITOR (CORREGIDO 🔥)
 # ==============================
 def monitor():
     while True:
@@ -142,10 +147,15 @@ def monitor():
 
         with lock:
             for cid in list(last_activity.keys()):
-                if now - last_activity[cid] > INACTIVITY:
+                inactive = now - last_activity[cid] > INACTIVITY
+
+                if inactive and queue.empty() and processing_count == 0:
                     send_report(cid)
                     del last_activity[cid]
 
+# ==============================
+# REPORTE BONITO
+# ==============================
 def send_report(cid):
     stats = batch_data.get(cid)
     if not stats:
@@ -186,7 +196,7 @@ def handle(message):
     try:
         queue.put(message, timeout=5)
     except:
-        bot.send_message(cid, "⚠️ Cola llena, espera un momento...")
+        bot.send_message(cid, "⚠️ Cola llena, espera...")
 
 # ==============================
 # SERVER
@@ -210,7 +220,7 @@ def keep_alive():
 # RUN
 # ==============================
 if __name__ == "__main__":
-    for _ in range(5):  # 5 workers controlados
+    for _ in range(5):
         Thread(target=worker, daemon=True).start()
 
     Thread(target=monitor, daemon=True).start()
